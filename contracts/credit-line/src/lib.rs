@@ -31,6 +31,14 @@
 //! `CreditLine::liquidate` and `PledgeVault::liquidate`. This is the least clean part of this
 //! skeleton.
 //!
+//! **Input bounds on `open`.** `open` refuses a non-positive or oversized `limit`
+//! (`MAX_LIMIT`), a `rate_bps` above `MAX_RATE_BPS`, a cure window shorter than `MIN_CURE_S`,
+//! `lender == borrower`, and an asset that has not been `configure_asset`d. Before these checks,
+//! a line could be opened with `rate_bps = u32::MAX` (the interest product then traps for a large
+//! line, blocking `ltv`, `release` and `liquidate`), with no cure window, against an unconfigured
+//! asset (the first `fund` panicked and left an orphan line id), or with the lender as the
+//! borrower. The caps are derived and documented at their definitions below.
+//!
 //! **Invariant 6** ("the admin cannot move user funds"): every function that moves USDC out of
 //! this contract (`draw`) or pulls funds in from a specific party (`fund`, `repay`) requires
 //! `require_auth` on the actual borrower/lender/payer address named in the call — never the
@@ -66,6 +74,24 @@ use soroban_sdk::{
 
 const SECONDS_PER_YEAR: i128 = 365 * 24 * 60 * 60;
 const BPS_DENOMINATOR: i128 = 10_000;
+
+/// The largest annual rate `open` accepts, in bps: 10,000 = 100% a year, the same cap `RepoDvP`
+/// applies to a repo's `rate_bps`. A larger rate makes `interest_delta`'s
+/// `drawn * rate_bps * elapsed` product grow fast enough to trap on i128 overflow for a large
+/// line, which would block `ltv`, `release` and `liquidate`.
+pub const MAX_RATE_BPS: u32 = 10_000;
+
+/// The shortest cure window `open` accepts, in seconds: one hour. PRD §5's default is 24h; a zero
+/// (or near-zero) window would let the keeper liquidate in the same breath as the margin call,
+/// giving the borrower no chance to top up or repay.
+pub const MIN_CURE_S: u64 = 3_600;
+
+/// The largest principal `open` accepts, in 7-decimal units: 100,000,000,000,000 stroops =
+/// 10,000,000 USDC. `interest_delta` computes `drawn * rate_bps * elapsed`; with
+/// `drawn <= MAX_LIMIT`, `rate_bps <= MAX_RATE_BPS` and `elapsed <= u64::MAX`, that product is at
+/// most 1e14 * 1e4 * 1.8e19 ≈ 1.8e37, below `i128::MAX` (≈ 1.7e38), so interest math cannot trap
+/// for a line `open` accepted.
+pub const MAX_LIMIT: i128 = 100_000_000_000_000;
 
 /// Cross-contract call to PriceGuard, declared as a local trait so CreditLine never takes a
 /// Cargo dependency on the price-guard crate (being rewritten concurrently by another agent).
@@ -346,6 +372,21 @@ impl CreditLine {
         ttl::extend_instance(&env);
         lender.require_auth();
         assert!(limit > 0, "credit-line: limit must be positive");
+        assert!(limit <= MAX_LIMIT, "credit-line: limit exceeds MAX_LIMIT");
+        assert!(
+            rate_bps <= MAX_RATE_BPS,
+            "credit-line: rate_bps exceeds MAX_RATE_BPS"
+        );
+        assert!(
+            cure_s >= MIN_CURE_S,
+            "credit-line: cure_s is below MIN_CURE_S"
+        );
+        assert!(
+            lender != borrower,
+            "credit-line: lender and borrower must differ"
+        );
+        // Fail here, before an id is consumed, rather than at the first `fund`.
+        read_asset_config(&env, &asset);
 
         let id: u64 = env
             .storage()
@@ -1065,6 +1106,122 @@ mod test {
                 margin_call_bps: 8_000,
                 liquidation_bps: 9_000,
             },
+        );
+    }
+
+    // --- open input bounds ----------------------------------------------------------------
+
+    fn try_open(
+        h: &Harness,
+        lender: &Address,
+        borrower: &Address,
+        asset: &Address,
+        limit: i128,
+        rate_bps: u32,
+        cure_s: u64,
+    ) -> u64 {
+        h.credit_line.open(
+            lender,
+            borrower,
+            asset,
+            &limit,
+            &rate_bps,
+            &cure_s,
+            &BytesN::from_array(&h.env, &[7u8; 32]),
+        )
+    }
+
+    #[test]
+    fn open_assigns_sequential_ids() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let limit = 1_000 * PRICE_SCALE;
+        let first = try_open(&h, &h.lender, &h.borrower, &h.asset, limit, 1_000, 86_400);
+        let second = try_open(&h, &h.lender, &h.borrower, &h.asset, limit, 1_000, 86_400);
+        assert_eq!(first, 0);
+        assert_eq!(second, first + 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: limit must be positive")]
+    fn open_rejects_zero_limit() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        try_open(&h, &h.lender, &h.borrower, &h.asset, 0, 1_000, 86_400);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: limit exceeds MAX_LIMIT")]
+    fn open_rejects_limit_above_the_cap() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let too_large = MAX_LIMIT + 1;
+        try_open(
+            &h,
+            &h.lender,
+            &h.borrower,
+            &h.asset,
+            too_large,
+            1_000,
+            86_400,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: rate_bps exceeds MAX_RATE_BPS")]
+    fn open_rejects_rate_above_the_cap() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        try_open(
+            &h,
+            &h.lender,
+            &h.borrower,
+            &h.asset,
+            1_000 * PRICE_SCALE,
+            u32::MAX,
+            86_400,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: cure_s is below MIN_CURE_S")]
+    fn open_rejects_cure_window_below_the_minimum() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        try_open(
+            &h,
+            &h.lender,
+            &h.borrower,
+            &h.asset,
+            1_000 * PRICE_SCALE,
+            1_000,
+            0,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: lender and borrower must differ")]
+    fn open_rejects_the_lender_as_borrower() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        try_open(
+            &h,
+            &h.lender,
+            &h.lender.clone(),
+            &h.asset,
+            1_000 * PRICE_SCALE,
+            1_000,
+            86_400,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: asset not configured")]
+    fn open_rejects_an_unconfigured_asset() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let unconfigured = Address::generate(&h.env);
+        try_open(
+            &h,
+            &h.lender,
+            &h.borrower,
+            &unconfigured,
+            1_000 * PRICE_SCALE,
+            1_000,
+            86_400,
         );
     }
 

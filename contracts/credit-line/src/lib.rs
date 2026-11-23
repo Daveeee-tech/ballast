@@ -857,9 +857,28 @@ impl CreditLine {
     /// A minimal, dedicated getter so `PledgeVault::release` can verify a caller actually owns
     /// the line they're claiming to release collateral from, without decoding this contract's
     /// full `Line` struct on the other side.
+    ///
+    /// Part of the vault-facing getter interface, with `lender_of` and `status_of`. Unknown lines
+    /// panic (`credit-line: unknown line`) like every other `Line` read.
     pub fn borrower_of(env: Env, line: u64) -> Address {
         ttl::extend_instance(&env);
         read_line(&env, line).borrower
+    }
+
+    /// A minimal, dedicated getter for `line`'s lender, so the vault can check a liquidation
+    /// recipient without decoding the whole `Line` struct. Vault-facing, like `borrower_of`;
+    /// unknown lines panic.
+    pub fn lender_of(env: Env, line: u64) -> Address {
+        ttl::extend_instance(&env);
+        read_line(&env, line).lender
+    }
+
+    /// `line`'s status (`Open`, `Liquidating` or `Closed`), so a caller can gate a path on the
+    /// state machine without decoding `Line`. Vault-facing, like `borrower_of`; unknown lines
+    /// panic.
+    pub fn status_of(env: Env, line: u64) -> LineStatus {
+        ttl::extend_instance(&env);
+        read_line(&env, line).status
     }
 
     /// Extends instance TTL and persistent storage TTL for `line` (and its claimable and
@@ -1491,6 +1510,37 @@ mod test {
             record_fields(&h.credit_line.liquidation_record(&id)),
             frozen
         );
+    }
+
+    #[test]
+    fn status_of_and_lender_of_report_each_state() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+
+        let open = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        assert_eq!(h.credit_line.status_of(&open), LineStatus::Open);
+        assert_eq!(h.credit_line.lender_of(&open), h.lender);
+
+        let liquidating = liquidated_line(&h, PRICE_SCALE / 2);
+        assert_eq!(h.credit_line.status_of(&liquidating), LineStatus::Liquidating);
+        assert_eq!(h.credit_line.lender_of(&liquidating), h.lender);
+
+        h.credit_line.close_liquidated(&h.lender, &liquidating);
+        assert_eq!(h.credit_line.status_of(&liquidating), LineStatus::Closed);
+        assert_eq!(h.credit_line.lender_of(&liquidating), h.lender);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: unknown line")]
+    fn status_of_panics_for_unknown_line() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        h.credit_line.status_of(&999);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: unknown line")]
+    fn lender_of_panics_for_unknown_line() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        h.credit_line.lender_of(&999);
     }
 
     #[test]

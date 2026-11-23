@@ -70,18 +70,31 @@ pub trait PriceGuardInterface {
     fn guarded_price(env: Env, asset: Address) -> GuardedPrice;
 }
 
-/// Cross-contract call to CreditLine's `ltv` view and its `borrower_of` getter. `LtvView` is
-/// redefined locally (see the struct below) rather than imported, since PledgeVault and CreditLine
-/// are decoupled crates by design — they're built together in this pass, so the shape is
-/// hand-kept in sync between the two rather than shared from a common source. That hand-sync is
-/// the wiring compromise called out above.
+/// Cross-contract call to CreditLine's `ltv` view and its small vault-facing getters. `LtvView`
+/// and `LineStatus` are redefined locally (see below) rather than imported, since PledgeVault and
+/// CreditLine are decoupled crates by design — they're built together in this pass, so the shapes
+/// are hand-kept in sync between the two rather than shared from a common source. That hand-sync
+/// is the wiring compromise called out above.
 #[contractclient(name = "CreditLineClient")]
 pub trait CreditLineInterface {
     fn ltv(env: Env, line: u64) -> LtvView;
     fn debt_of(env: Env, line: u64) -> i128;
     fn borrower_of(env: Env, line: u64) -> Address;
+    fn lender_of(env: Env, line: u64) -> Address;
+    fn status_of(env: Env, line: u64) -> LineStatus;
     fn asset_of(env: Env, line: u64) -> Address;
     fn sync_from_vault(env: Env, vault: Address, line: u64, asset: Address, units: i128);
+}
+
+/// Mirrors `ballast_credit_line::LineStatus` variant-for-variant. A unit-only `#[contracttype]`
+/// enum is encoded on the wire as a symbol, not by Rust type name, so a cross-call into
+/// CreditLine's `status_of` decodes correctly into this independently-defined type.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LineStatus {
+    Open,
+    Liquidating,
+    Closed,
 }
 
 /// Mirrors `ballast_credit_line::LtvView` field-for-field. Soroban structs are encoded on the
@@ -609,10 +622,11 @@ mod test {
         }
     }
 
-    // A minimal in-crate mock CreditLine exposing just `ltv`/`borrower_of`, returning canned
-    // values — this crate never depends on the real `ballast-credit-line` crate.
+    // A minimal in-crate mock CreditLine exposing just the vault-facing getters
+    // (`ltv`/`debt_of`/`borrower_of`/`lender_of`/`status_of`/`asset_of`), returning canned values —
+    // this crate never depends on the real `ballast-credit-line` crate.
     mod mock_credit_line {
-        use crate::LtvView;
+        use crate::{LineStatus, LtvView};
         use ballast_common::{margin::MarginState, price::PriceStatus};
         use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
 
@@ -623,6 +637,8 @@ mod test {
         enum DataKey {
             Debt,
             Borrower,
+            Lender,
+            Status,
             Asset,
             Synced,
         }
@@ -635,6 +651,14 @@ mod test {
 
             pub fn set_borrower(env: Env, borrower: Address) {
                 env.storage().instance().set(&DataKey::Borrower, &borrower);
+            }
+
+            pub fn set_lender(env: Env, lender: Address) {
+                env.storage().instance().set(&DataKey::Lender, &lender);
+            }
+
+            pub fn set_status(env: Env, status: LineStatus) {
+                env.storage().instance().set(&DataKey::Status, &status);
             }
 
             pub fn debt_of(env: Env, _line: u64) -> i128 {
@@ -657,6 +681,20 @@ mod test {
                     .instance()
                     .get(&DataKey::Borrower)
                     .expect("mock-credit-line: borrower not set")
+            }
+
+            pub fn lender_of(env: Env, _line: u64) -> Address {
+                env.storage()
+                    .instance()
+                    .get(&DataKey::Lender)
+                    .expect("mock-credit-line: lender not set")
+            }
+
+            pub fn status_of(env: Env, _line: u64) -> LineStatus {
+                env.storage()
+                    .instance()
+                    .get(&DataKey::Status)
+                    .expect("mock-credit-line: status not set")
             }
 
             pub fn set_asset(env: Env, asset: Address) {

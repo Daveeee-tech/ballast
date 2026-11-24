@@ -15,9 +15,8 @@ clear it, and clearing it asserts that the large move was real, not manipulation
 > spike has reverted since the halt, confirming sets the baseline to the spike. The next
 > ordinary price then looks like a large drop against that baseline and can halt again, and
 > collateral is valued at the spike in the meantime. Always re-read the values immediately
-> before confirming (step 4). This is a known behaviour of the current contract, not a
-> documentation mistake; it has no public issue number yet (tracked in the repository's
-> backlog).
+> before confirming (step 4). This is known behaviour of the current contract, not a
+> documentation mistake: see [#127](https://github.com/DevTobis/ballast/issues/127).
 
 ---
 
@@ -39,6 +38,10 @@ stellar contract invoke \
   --id "$PRICE_GUARD_CID" --network "$NETWORK" --source risk \
   -- halt_info --asset "$RWA_SAC"
 ```
+
+On a deployment whose `PriceGuard` predates #1160 the `halt_info` and `last_good` entry points do
+not exist yet (see [Verification status](#verification-status)); redeploy first with
+`scripts/redeploy-price-guard.sh`.
 
 `guarded_price` returns `{ value, status, ts, sources }`. `halt_info` returns `None` when the
 asset is not halted, otherwise `{ last_good, pending }`:
@@ -189,8 +192,26 @@ Record in the incident: the asset, the `halt_latched` transaction/ledger, `last_
 
 ## Verification status
 
-The commands above follow the contract entry points and the existing `stellar contract invoke`
-patterns in `scripts/` and `TROUBLESHOOTING.md`, but they were **not executed against testnet
-while writing this runbook** (no deployed identities or network access in the authoring
-environment). Treat them as untested until an on-call has exercised them on testnet, and
-update this note when that happens.
+Exercised against the testnet deployment recorded in
+[`TESTNET_DEPLOYMENT.md`](../../TESTNET_DEPLOYMENT.md) (`price-guard`
+`CCSIO64AJEN3ITER7QXLTETSG5LZ2EIQWO5ON2TEVPOOKHBFR2ZVYUOP`, deployed 2026-10-26) on 2026-11-24
+with `stellar` 28.1.0, asset `RWA1` (`CBUHRZ2D5EDPEY36Z4QHHAXV3XRKGLRYK7Y7HCD77YPL5G6IUNBCA7BZ`).
+
+| Command | Outcome |
+|---|---|
+| `guarded_price` | **Run, works.** Returned `{"status":"Degraded","value":"10782785","sources":[],"ts":1795564187}`. |
+| `asset_config` | **Run, works.** Returned `{"band_bps":50,"daily_move_band_bps":100,"max_staleness_s":46800,"window_seconds":86400,"window_move_band_bps":100}`. |
+| `pending_config` | **Run, works.** `--id 0` returns `null` on this deployment (nothing queued). |
+| `halt_info` | **Cannot run on this deployment.** The deployed wasm has no `halt_info` entry point — the getters landed in #1160 on 2026-11-22, after the 2026-10-26 deploy — so the CLI rejects the call with `error: unrecognized subcommand 'halt_info'`. Run `scripts/redeploy-price-guard.sh` before relying on step 1 or step 4. |
+| `last_good` | **Cannot run on this deployment**, same cause and the same `unrecognized subcommand` error. |
+| `confirm_halt_cleared` | **Still untested.** It is the one write in this runbook, so it needs the `risk` signing key (only that role's public address is committed here) and an actually halted asset; this deployment had no halt to clear and no identity was available. It *is* present in the deployed contract's spec, so the entry point itself exists. |
+
+Read-only runs used `--source-account "$RISK" --send=no` instead of `--source risk`: a public key
+cannot sign, and `--send=no` keeps the call a pure simulation. Without `--send=no` the same call
+fails with `No sign with key provided`. Note that `guarded_price` is not a pure storage read — the
+simulation emitted `status_changed (Ok → Degraded)` — so the flag is what keeps it non-mutating.
+
+`Degraded` is the correct reading on this deployment today, not a fault: the push-based sources
+were last written on deploy day, well past `max_staleness_s`, so until the publisher runs the guard
+refuses to quote `Ok` and holds the last good value. A halt cannot latch from stale data, so the
+`Halted` paths in steps 1–5 need fresh publishes first.

@@ -87,12 +87,20 @@ pub const MAX_RATE_BPS: u32 = 10_000;
 /// giving the borrower no chance to top up or repay.
 pub const MIN_CURE_S: u64 = 3_600;
 
-/// The largest principal `open` accepts, in 7-decimal units: 100,000,000,000,000 stroops =
-/// 10,000,000 USDC. `interest_delta` computes `drawn * rate_bps * elapsed`; with
-/// `drawn <= MAX_LIMIT`, `rate_bps <= MAX_RATE_BPS` and `elapsed <= u64::MAX`, that product is at
-/// most 1e14 * 1e4 * 1.8e19 ≈ 1.8e37, below `i128::MAX` (≈ 1.7e38), so interest math cannot trap
-/// for a line `open` accepted.
-pub const MAX_LIMIT: i128 = 100_000_000_000_000;
+/// The longest term the `MAX_LIMIT` overflow bound assumes: 100 years. A line can be opened for
+/// any duration `open` accepts, but accrual that far out is already far beyond any realistic
+/// credit-line term and still leaves the interest product well inside `i128`.
+pub const MAX_TERM_S: u64 = 100 * 365 * 24 * 60 * 60;
+
+/// The largest principal `open` accepts, in 7-decimal units. Derived from the worst case for
+/// `rate_delta`'s `drawn * bps * elapsed` product: the full `MAX_TERM_S` at the combined annual
+/// cap `MAX_RATE_BPS + MAX_FEE_BPS` = 20,000 bps. Keeping that product at or below `i128::MAX`
+/// means interest and fee accrual cannot trap for a line `open` accepted, even if the line sits
+/// untouched for the whole term. `rate_delta` computes the rate and the fee separately, so using
+/// the combined cap here is already conservative. This is an overflow guard, not an economic
+/// limit: per-deployment exposure limits belong elsewhere.
+pub const MAX_LIMIT: i128 =
+    i128::MAX / ((MAX_RATE_BPS as i128 + MAX_FEE_BPS as i128) * MAX_TERM_S as i128);
 
 /// Cross-contract call to PriceGuard, declared as a local trait so CreditLine never takes a
 /// Cargo dependency on the price-guard crate (being rewritten concurrently by another agent).
@@ -423,7 +431,22 @@ impl CreditLine {
         ttl::extend_instance(&env);
         lender.require_auth();
         assert!(limit > 0, "credit-line: limit must be positive");
+        assert!(limit <= MAX_LIMIT, "credit-line: limit exceeds MAX_LIMIT");
+        assert!(
+            rate_bps <= MAX_RATE_BPS,
+            "credit-line: rate_bps exceeds MAX_RATE_BPS"
+        );
+        assert!(
+            cure_s >= MIN_CURE_S,
+            "credit-line: cure_s is below MIN_CURE_S"
+        );
+        assert!(
+            lender != borrower,
+            "credit-line: lender and borrower must differ"
+        );
         assert!(fee_bps <= MAX_FEE_BPS, "credit-line: fee_bps exceeds 10_000");
+        // Fail here, before an id is consumed, rather than at the first `fund`.
+        read_asset_config(&env, &asset);
 
         let id: u64 = env
             .storage()
@@ -1245,6 +1268,7 @@ mod test {
             asset,
             &limit,
             &rate_bps,
+            &0,
             &cure_s,
             &BytesN::from_array(&h.env, &[7u8; 32]),
         )
